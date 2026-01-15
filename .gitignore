@@ -1,0 +1,16 @@
+# 模型文件（不上传）
+Qwen3-VL-4B-Instruct/
+Qwen3-VL-8B-Instruct/
+*.safetensors
+*.bin
+*.gguf
+
+# 缓存
+__pycache__/
+*.pyc
+.cache/
+.autodl/
+
+# 其他
+*.log
+.DS_Store
