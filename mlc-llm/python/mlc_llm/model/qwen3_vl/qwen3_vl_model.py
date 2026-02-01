@@ -1,6 +1,7 @@
 """
 Minimal model for Qwen3-VL.
 """
+from tvm import te, tir
 from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Tensor, op
 
@@ -9,9 +10,10 @@ from .qwen_2_5_vl import Qwen2_5_VLModel
 
 from .qwen3_vl_vision import Qwen3VLVisionModel
 from .qwen3_vl_text import Qwen3VLTextModel
+from mlc_llm.model.qwen3.qwen3_model import Qwen3Model
 
 from typing import Optional, Union
-from tvm import tir
+from mlc_llm import op as op_ext
 from mlc_llm.nn import PagedKVCache, RopeMode
 
 
@@ -296,14 +298,160 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.model = Qwen3VLModel(config)
+        # Store commonly used config values
+        self.hidden_size = config.text_config.hidden_size
+        self.num_hidden_layers = config.text_config.num_hidden_layers
+        self.num_attention_heads = config.text_config.num_attention_heads
+        self.num_key_value_heads = config.text_config.num_key_value_heads
+        self.head_dim = config.text_config.head_dim
+        self.rope_theta = config.text_config.rope_theta
+        self.vocab_size = config.text_config.vocab_size
+        self.tensor_parallel_shards = config.text_config.tensor_parallel_shards
+        self.tie_word_embeddings = config.text_config.tie_word_embeddings
+        self.dtype = "float32"  # Will be updated by to()
+
+    def to(self, dtype: Optional[str] = None):
+        """Convert model to specified dtype."""
+        super().to(dtype=dtype)
+        if dtype is not None:
+            self.dtype = dtype
+
+    def embed(self, input_ids: Tensor):
+        """Embed token IDs into hidden states."""
+        if self.tensor_parallel_shards > 1:
+            input_ids = op.ccl_broadcast_from_worker0(input_ids)
+        return self.model.language_model.embed_tokens(input_ids)
+
+    def batch_forward(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        logit_positions: Optional[Tensor] = None,
+    ):
+        """Batch forward pass."""
+        op_ext.configure()
+
+        # Call Qwen3Model.forward directly (bypassing Qwen3VLTextModel.forward which raises NotImplementedError)
+        hidden_states = Qwen3Model.forward(self.model.language_model, input_embeds, paged_kv_cache)
+        if logit_positions is not None:
+            hidden_states = op.take(hidden_states, logit_positions, axis=1)
+
+        if self.tie_word_embeddings:
+            logits = self.model.language_model.embed_tokens.lm_head_forward(hidden_states)
+        else:
+            logits = self.model.language_model.lm_head(hidden_states)
+        if logits.dtype != "float32":
+            logits = logits.astype("float32")
+        return logits
 
     def prefill(self, input_embed: Tensor, paged_kv_cache: PagedKVCache):
-        b, s, d = input_embed.shape
-        return op.zeros((b, s, self.config.text_config.vocab_size), dtype="float32"), paged_kv_cache
+        """Prefill step: process full input sequence and return logits for last token."""
+        op_ext.configure()
+
+        def _index(x: te.Tensor):
+            b, s, d = x.shape
+            return te.compute((b, 1, d), lambda i, _, k: x[i, s - 1, k], name="index")
+
+        # Call Qwen3Model.forward directly
+        hidden_states = Qwen3Model.forward(self.model.language_model, input_embed, paged_kv_cache)
+        hidden_states = op.tensor_expr_op(_index, name_hint="index", args=[hidden_states])
+
+        if self.tie_word_embeddings:
+            logits = self.model.language_model.embed_tokens.lm_head_forward(hidden_states)
+        else:
+            logits = self.model.language_model.lm_head(hidden_states)
+        if logits.dtype != "float32":
+            logits = logits.astype("float32")
+        return logits, paged_kv_cache
 
     def decode(self, input_embed: Tensor, paged_kv_cache: PagedKVCache):
-        b, s, d = input_embed.shape
-        return op.zeros((b, s, self.config.text_config.vocab_size), dtype="float32"), paged_kv_cache
+        """Decode step: process single token."""
+        op_ext.configure()
+
+        # Call Qwen3Model.forward directly
+        hidden_states = Qwen3Model.forward(self.model.language_model, input_embed, paged_kv_cache)
+
+        if self.tie_word_embeddings:
+            logits = self.model.language_model.embed_tokens.lm_head_forward(hidden_states)
+        else:
+            logits = self.model.language_model.lm_head(hidden_states)
+        if logits.dtype != "float32":
+            logits = logits.astype("float32")
+        return logits, paged_kv_cache
+
+    def batch_prefill(
+        self, input_embeds: Tensor, logit_positions: Tensor, paged_kv_cache: PagedKVCache
+    ):
+        """Batch prefill step."""
+        if self.tensor_parallel_shards > 1:
+            logit_positions = op.ccl_broadcast_from_worker0(logit_positions)
+        logits = self.batch_forward(input_embeds, paged_kv_cache, logit_positions)
+        return logits, paged_kv_cache
+
+    def batch_decode(self, input_embeds: Tensor, paged_kv_cache: PagedKVCache):
+        """Batch decode step."""
+        logits = self.batch_forward(input_embeds, paged_kv_cache)
+        return logits, paged_kv_cache
+
+    def batch_verify(self, input_embeds: Tensor, paged_kv_cache: PagedKVCache):
+        """Batch verify step for speculative decoding."""
+        logits = self.batch_forward(input_embeds, paged_kv_cache)
+        return logits, paged_kv_cache
+
+    def image_embed(
+        self,
+        pixel_values: Tensor,
+        rotary_cos: Tensor,
+        rotary_sin: Tensor,
+        position_ids: Tensor,
+    ) -> Tensor:
+        """
+        Embed image pixels into hidden states with proper 2D position encoding.
+        
+        Args:
+            pixel_values: Preprocessed image tensor of shape (N, C, T, H, W)
+            rotary_cos: Precomputed cosine for RoPE, shape (N, head_dim)
+            rotary_sin: Precomputed sine for RoPE, shape (N, head_dim)
+            position_ids: Position IDs for learned embeddings, shape (N,)
+            
+        Returns:
+            Image embeddings of shape (num_image_tokens, hidden_size)
+        """
+        self.model.visual.dtype = self.dtype
+        pixel_values = pixel_values.astype(self.dtype)
+        rotary_cos = rotary_cos.astype(self.dtype)
+        rotary_sin = rotary_sin.astype(self.dtype)
+        
+        # Call Vision model with precomputed position embeddings
+        vision_output = self.model.visual.forward_with_pos(
+            pixel_values, rotary_cos, rotary_sin, position_ids
+        )
+        
+        if isinstance(vision_output, (list, tuple)):
+            image_embeds = vision_output[0]
+        else:
+            image_embeds = vision_output
+            
+        return image_embeds
+    
+    def image_embed_simple(
+        self,
+        pixel_values: Tensor,
+    ) -> Tensor:
+        """
+        Embed image using sequential position IDs (simplified version).
+        """
+        self.model.visual.dtype = self.dtype
+        pixel_values = pixel_values.astype(self.dtype)
+        
+        vision_output = self.model.visual.forward_simple(pixel_values)
+        
+        if isinstance(vision_output, (list, tuple)):
+            image_embeds = vision_output[0]
+        else:
+            image_embeds = vision_output
+            
+        return image_embeds
 
     def create_paged_kv_cache(  # pylint: disable=too-many-arguments
         self,
@@ -320,21 +468,57 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             prefill_chunk_size=prefill_chunk_size,
             page_size=page_size,
             support_sliding_window=support_sliding_window,
-            num_hidden_layers=self.config.text_config.num_hidden_layers,
-            num_attention_heads=self.config.text_config.num_attention_heads // self.config.text_config.tensor_parallel_shards,
-            num_key_value_heads=self.config.text_config.num_key_value_heads // self.config.text_config.tensor_parallel_shards,
-            qk_head_dim=self.config.text_config.head_dim,
-            v_head_dim=self.config.text_config.head_dim,
+            num_hidden_layers=self.num_hidden_layers,
+            num_attention_heads=self.num_attention_heads // self.tensor_parallel_shards,
+            num_key_value_heads=self.num_key_value_heads // self.tensor_parallel_shards,
+            qk_head_dim=self.head_dim,
+            v_head_dim=self.head_dim,
             rope_mode=RopeMode.NORMAL,
             rope_scale=1,
-            rope_theta=self.config.text_config.rope_theta,
-            dtype=self.config.text_config.dtype,
+            rope_theta=self.rope_theta,
+            dtype=self.dtype,  # Use self.dtype which is updated by to() method
         )
 
     def get_default_spec(self):
+        # Vision config
+        vision_config = self.config.vision_config
+        temporal_patch_size = vision_config.temporal_patch_size  # 2
+        patch_size = vision_config.patch_size  # 16
+        in_channels = vision_config.in_channels  # 3
+        
         mod_spec = {
+            "embed": {
+                "input_ids": nn.spec.Tensor(["seq_len"], "int32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "image_embed": {
+                "pixel_values": nn.spec.Tensor(
+                    ["num_patches", in_channels * temporal_patch_size * patch_size * patch_size],
+                    self.dtype,
+                ),
+                "rotary_cos": nn.spec.Tensor(["num_patches", vision_config.hidden_size // vision_config.num_heads], self.dtype),
+                "rotary_sin": nn.spec.Tensor(["num_patches", vision_config.hidden_size // vision_config.num_heads], self.dtype),
+                "position_ids": nn.spec.Tensor(["num_patches"], "int32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "image_embed_simple": {
+                "pixel_values": nn.spec.Tensor(
+                    ["num_patches", in_channels * temporal_patch_size * patch_size * patch_size],
+                    self.dtype,
+                ),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
             "prefill": {
-                "input_embed": nn.spec.Tensor([1, "seq_len", self.config.text_config.hidden_size], "float32"),
+                "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
                 "$": {
                     "param_mode": "packed",
@@ -342,7 +526,32 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 },
             },
             "decode": {
-                "input_embed": nn.spec.Tensor([1, 1, self.config.text_config.hidden_size], "float32"),
+                "input_embed": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_prefill": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "logit_positions": nn.spec.Tensor(["batch_size"], "int32"),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_decode": {
+                "input_embeds": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_verify": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
                 "$": {
                     "param_mode": "packed",

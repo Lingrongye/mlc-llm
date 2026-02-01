@@ -115,6 +115,10 @@ class VisionAttention(nn.Module):
             cos = op.concat([cos, cos], dim=-1)
             sin = op.concat([sin, sin], dim=-1)
             
+            # Cast to match q/k dtype
+            cos = cos.astype(q.dtype)
+            sin = sin.astype(q.dtype)
+            
             def rotate_half(x):
                 x1, x2 = op.split(x, 2, axis=-1) # split last dim
                 return op.concat([op.negative(x2), x1], dim=-1)
